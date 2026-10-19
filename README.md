@@ -338,6 +338,13 @@ components, and its owner reported the same underlying route, but this exact
 implementation has not been run on an S90D. The agent still has Samsung's
 `User` SMACK label; UID 0 is not proof that every security boundary is gone.
 
+The route also supports Samsung's Tizen-specific `dotnet` launcher, which
+does not implement the desktop `--list-runtimes` option. On that host it
+checks for the CLR library and core assembly in installed runtime directories
+and passes the selected directory with `--clr-path` to both payloads. This
+path was verified on a Q60D running Tizen 9 / ARM32; authenticated UID 0,
+unchanged system-file hashes, and staging cleanup were confirmed.
+
 ```console
 ./samsung-tv-root archive-root probe "$TV_IP"
 ./samsung-tv-root archive-root root "$TV_IP" --command 'id'

